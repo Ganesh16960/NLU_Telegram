@@ -1,17 +1,9 @@
-import streamlit as st
-from typing import List, Dict, Any
 import re
+from typing import List, Dict, Any
 
-# External library for RSS parsing
-try:
-    import feedparser
-except ImportError:
-    st.error(
-        "The 'feedparser' package is not installed.\n\n"
-        "Add this line to your requirements.txt file and redeploy:\n\n"
-        "    feedparser"
-    )
-    st.stop()
+import streamlit as st
+import feedparser
+import requests
 
 # ----------------- Config -----------------
 
@@ -92,17 +84,62 @@ def parse_entry(entry: Any) -> Dict[str, Any]:
     }
 
 
+def send_to_telegram(
+    articles: List[Dict[str, Any]],
+    bot_token: str,
+    chat_id: str,
+    max_messages: int = 5,
+):
+    """Send top N articles to Telegram."""
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+
+    count = 0
+    for art in articles:
+        if count >= max_messages:
+            break
+
+        title = art.get("title") or "No title"
+        summary = art.get("summary") or ""
+        link = art.get("link") or ""
+
+        parts = [f"Title: {title}"]
+        if summary:
+            parts.append(f"Summary: {summary}")
+        if link:
+            parts.append(f"Link: {link}")
+
+        text = "\n\n".join(parts)
+
+        resp = requests.post(
+            url,
+            data={
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": False,
+            },
+            timeout=15,
+        )
+        if not resp.ok:
+            st.error(f"Failed to send message {count+1}: {resp.text}")
+        else:
+            count += 1
+
+    return count
+
+
 # ----------------- Streamlit UI -----------------
 
-st.set_page_config(page_title="RSS → RAG Summaries", page_icon="📰", layout="centered")
+st.set_page_config(page_title="RSS → Telegram RAG", page_icon="📨", layout="centered")
 
-st.title("📰 RSS → RAG Summaries")
+st.title("📨 RSS → Telegram (RAG-style summaries)")
 
 st.write(
-    "Enter one or more RSS feed URLs (one per line). "
-    "The app will fetch articles, create short summaries, "
-    "and use simple similarity with previous articles as context."
+    "1) Enter RSS URLs and fetch articles\n"
+    "2) Review summaries\n"
+    "3) Click **Send to Telegram** to push them with one click"
 )
+
+# --- RSS input ---
 
 rss_input = st.text_area(
     "RSS feed URLs (one per line):",
@@ -111,62 +148,119 @@ rss_input = st.text_area(
 )
 
 max_articles = st.number_input(
-    "Max articles to show (per fetch):",
+    "Max articles to fetch:",
     min_value=1,
     max_value=200,
-    value=50,
+    value=30,
     step=1,
 )
 
-if st.button("Fetch & summarize"):
+max_messages = st.number_input(
+    "Max articles to send to Telegram:",
+    min_value=1,
+    max_value=20,
+    value=5,
+    step=1,
+)
+
+# --- Telegram config ---
+
+st.subheader("Telegram configuration")
+
+# Try to read from secrets if set in Streamlit Cloud
+default_bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "") if hasattr(st, "secrets") else ""
+default_chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "") if hasattr(st, "secrets") else ""
+
+bot_token = st.text_input(
+    "Telegram Bot Token",
+    value=default_bot_token,
+    type="password",
+    help="Bot token from @BotFather",
+)
+
+chat_id = st.text_input(
+    "Telegram Chat ID",
+    value=default_chat_id,
+    help="Your user / group / channel chat ID",
+)
+
+# --- Session state to store fetched articles ---
+
+if "articles" not in st.session_state:
+    st.session_state["articles"] = []  # list of dicts with title, summary, link, published
+
+
+# --- Fetch & summarize button ---
+
+if st.button("🔍 Fetch & summarize"):
     urls = [u.strip() for u in rss_input.splitlines() if u.strip()]
     if not urls:
         st.warning("Please enter at least one RSS URL.")
-        st.stop()
+    else:
+        all_articles: List[Dict[str, Any]] = []
+        with st.spinner("Fetching RSS feeds..."):
+            for url in urls:
+                st.write(f"🔗 Fetching: `{url}`")
+                try:
+                    feed = feedparser.parse(url)
+                except Exception as e:
+                    st.error(f"Error fetching {url}: {e}")
+                    continue
 
-    all_articles: List[Dict[str, Any]] = []
+                for e in feed.entries:
+                    all_articles.append(parse_entry(e))
 
-    with st.spinner("Fetching RSS feeds..."):
-        for url in urls:
-            st.write(f"🔗 Fetching: `{url}`")
-            try:
-                feed = feedparser.parse(url)
-            except Exception as e:
-                st.error(f"Error fetching {url}: {e}")
-                continue
+        if not all_articles:
+            st.warning("No articles found. Check your RSS URLs.")
+        else:
+            # Limit number of articles
+            all_articles = all_articles[: max_articles]
 
-            for e in feed.entries:
-                all_articles.append(parse_entry(e))
+            # Build RAG-style summaries
+            history: List[Dict[str, Any]] = []
+            for art in all_articles:
+                rag_summary = build_rag_summary(art, history)
+                history.append(
+                    {
+                        "title": art["title"],
+                        "summary": rag_summary,
+                        "link": art["link"],
+                        "published": art["published"],
+                    }
+                )
 
-    if not all_articles:
-        st.warning("No articles found. Check your RSS URLs.")
-        st.stop()
+            st.session_state["articles"] = history
+            st.success(f"Fetched and summarized {len(history)} articles.")
 
-    # Limit number of articles
-    all_articles = all_articles[: max_articles]
 
-    # Build RAG-style summaries using previous articles as context
-    st.success(f"Fetched {len(all_articles)} articles. Generating summaries...")
-    history: List[Dict[str, Any]] = []
+# --- Show summaries if available ---
 
-    for art in all_articles:
-        rag_summary = build_rag_summary(art, history)
-        history.append(
-            {
-                "title": art["title"],
-                "summary": rag_summary,
-                "link": art["link"],
-                "published": art["published"],
-            }
-        )
+articles = st.session_state.get("articles", [])
 
-    st.subheader("Summaries")
-
-    for a in history:
-        st.markdown(f"### {a['title'] or 'Untitled article'}")
+if articles:
+    st.subheader("Preview of articles to send")
+    for i, a in enumerate(articles, start=1):
+        st.markdown(f"### {i}. {a['title'] or 'Untitled article'}")
         if a.get("published"):
             st.caption(f"Published: {a['published']}")
         st.write(a["summary"] or "_No summary available._")
         if a["link"]:
             st.markdown(f"[Read more]({a['link']})")
         st.write("---")
+
+    # --- Send to Telegram button ---
+    if st.button("📨 Send to Telegram"):
+        if not bot_token or not chat_id:
+            st.error("Please fill in both Telegram Bot Token and Chat ID.")
+        else:
+            with st.spinner("Sending messages to Telegram..."):
+                sent_count = send_to_telegram(
+                    articles=articles,
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    max_messages=max_messages,
+                )
+
+            st.success(f"Sent {sent_count} message(s) to Telegram.")
+else:
+    st.info("Fetch summaries first, then you can send them to Telegram.")
